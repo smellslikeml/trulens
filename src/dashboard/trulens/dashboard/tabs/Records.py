@@ -11,6 +11,7 @@ from trulens.dashboard.constants import EXTERNAL_APP_COL_NAME
 from trulens.dashboard.constants import HIDE_RECORD_COL_NAME
 from trulens.dashboard.constants import PINNED_COL_NAME
 from trulens.dashboard.constants import RECORDS_PAGE_NAME as page_name
+from trulens.dashboard.utils import reasoning_outline
 from trulens.dashboard.utils import streamlit_compat
 from trulens.dashboard.utils.dashboard_utils import ST_RECORDS_LIMIT
 from trulens.dashboard.utils.dashboard_utils import _get_event_otel_spans
@@ -176,6 +177,38 @@ def _render_record_metrics(
         )
 
 
+def _render_reasoning_outline(spans: List[Any]):
+    """Render a collapsible hierarchical reasoning outline for a trace.
+
+    Separates high-level strategy spans from low-level execution spans and
+    surfaces a compact reasoning profile so long reasoning/agent traces can be
+    audited before drilling into the full timeline. Adapted from ReasoningLens
+    (arXiv:2606.23404).
+    """
+    profile = reasoning_outline.summarize_reasoning_profile(spans)
+    if profile["total_spans"] <= 1:
+        # A single-span (or empty) trace has no hierarchy worth collapsing.
+        return
+
+    with st.expander("Reasoning Outline", expanded=False):
+        cols = st_columns(4)
+        cols[0].metric("Strategy steps", profile["strategy_count"])
+        cols[1].metric("Execution steps", profile["execution_count"])
+        cols[2].metric("Max depth", profile["max_depth"])
+        cols[3].metric("Errors", profile["error_count"])
+
+        lines = []
+        roots = reasoning_outline.build_reasoning_outline(spans)
+        for node, depth in reasoning_outline.iter_outline(roots):
+            indent = "    " * depth
+            marker = reasoning_outline.LEVEL_MARKERS.get(node.level, "·")
+            status = " ⚠️" if node.is_error else ""
+            lines.append(
+                f"{indent}{marker} {node.name} [{node.span_type}]{status}"
+            )
+        st.code("\n".join(lines), language="text")
+
+
 def _render_record_detail(
     selected_row: pd.Series,
     records_df: pd.DataFrame,
@@ -259,6 +292,7 @@ def _render_record_detail(
                 selected_row["record_id"], selected_row["app_name"]
             )
             if event_spans:
+                _render_reasoning_outline(event_spans)
                 record_viewer_otel(
                     spans=event_spans,
                     key=f"{page_name}.trace.{suffix}",
