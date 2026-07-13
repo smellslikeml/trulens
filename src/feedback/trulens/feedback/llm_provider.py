@@ -28,6 +28,7 @@ from trulens.core.utils import deprecation as deprecation_utils
 from trulens.core.utils.threading import ThreadPoolExecutor
 from trulens.feedback import generated as feedback_generated
 from trulens.feedback import output_schemas as feedback_output_schemas
+from trulens.feedback import verifier_score as feedback_verifier_score
 from trulens.feedback.templates import agent as templates_agent
 from trulens.feedback.templates import base as templates_base
 from trulens.feedback.templates import quality as templates_quality
@@ -279,6 +280,74 @@ class LLMProvider(core_provider.Provider):
             )
 
         return (score - min_score_val) / (max_score_val - min_score_val)
+
+    def generate_verifier_score(
+        self,
+        system_prompt: str,
+        user_prompt: Optional[str] = None,
+        min_score_val: int = 0,
+        max_score_val: int = 10,
+        temperature: float = 0.0,
+        n_samples: int = 1,
+        score_logprobs: Optional[
+            feedback_verifier_score.LogprobDistribution
+        ] = None,
+    ) -> float:
+        """Continuous verification score in ``[0, 1]`` for a judged output.
+
+        Unlike [generate_score][trulens.feedback.llm_provider.LLMProvider.generate_score],
+        which parses a single discrete rating, this estimates the *expectation*
+        of the rating under the judge's scoring distribution, giving a
+        finer-grained, better-calibrated signal. Adapted from LLM-as-a-Verifier
+        (arXiv:2607.05391).
+
+        If ``score_logprobs`` is provided (the scoring token's top-logprobs, as
+        exposed by providers like OpenAI), the expectation is computed exactly.
+        Otherwise it is estimated by Monte-Carlo averaging of ``n_samples``
+        discrete [generate_score][trulens.feedback.llm_provider.LLMProvider.generate_score]
+        evaluations (use ``temperature > 0`` for the repeated-evaluation axis to
+        reduce variance). The discrete parse remains the underlying fallback.
+
+        Args:
+            system_prompt (str): A pre-formatted system prompt.
+            user_prompt (Optional[str]): An optional user prompt.
+            min_score_val (int): The minimum score value.
+            max_score_val (int): The maximum score value.
+            temperature (float): The temperature for the LLM response.
+            n_samples (int): Number of repeated evaluations to average when
+                ``score_logprobs`` is not supplied.
+            score_logprobs: Optional top-logprobs for the scoring token.
+
+        Returns:
+            The continuous score normalized to a 0-1 scale.
+        """
+
+        assert (
+            max_score_val > min_score_val
+        ), "Max score must be greater than min score."
+
+        if score_logprobs is not None:
+            return feedback_verifier_score.expected_score_from_logprobs(
+                score_logprobs,
+                min_score_val=min_score_val,
+                max_score_val=max_score_val,
+            )
+
+        samples: List[float] = []
+        for _ in range(max(1, n_samples)):
+            result = self.generate_score(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                min_score_val=min_score_val,
+                max_score_val=max_score_val,
+                temperature=temperature,
+            )
+            # generate_score may return a bare float or a (score, reasons)
+            # tuple depending on the response path; normalize to a scalar.
+            score = result[0] if isinstance(result, tuple) else result
+            samples.append(score)
+
+        return feedback_verifier_score.aggregate_repeated_scores(samples)
 
     def generate_score_and_reasons(
         self,
